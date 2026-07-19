@@ -1,0 +1,656 @@
+#!/bin/bash
+set -euo pipefail
+
+HARNESSVM_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+HARNESSVM_STATE_ROOT=${HARNESSVM_STATE_ROOT:-"${XDG_STATE_HOME:-$HOME/.local/state}/harnessvm"}
+HARNESSVM_LIMA_HOME=${HARNESSVM_LIMA_HOME:-"$HARNESSVM_STATE_ROOT/lima"}
+HARNESSVM_INSTANCE=${HARNESSVM_INSTANCE:-harnessvm-desktop}
+HARNESSVM_SESSIONS="$HARNESSVM_STATE_ROOT/sessions"
+HARNESSVM_GUEST_PROJECT=/home/harnessvm/.local/share/harnessvm/project
+HARNESSVM_STATE_VERSION=2
+export LIMA_HOME="$HARNESSVM_LIMA_HOME"
+
+HARNESSVM_CPUS=4
+HARNESSVM_MEMORY_GIB=8
+HARNESSVM_DISK_GIB=30
+HARNESSVM_VM_TYPE=vz
+HARNESSVM_ARCH=aarch64
+HARNESSVM_MOUNT_TYPE=virtiofs
+HARNESSVM_TIMEZONE=Etc/UTC
+HARNESSVM_OPEN_BROWSER=1
+HARNESSVM_HARNESSES=codex,claude
+HARNESSVM_PERSIST_DIRS=
+HARNESSVM_DEFAULT_ALLOW=
+HARNESSVM_START_TIMEOUT=10m
+HARNESSVM_DESKTOP_WIDTH=1920
+HARNESSVM_DESKTOP_HEIGHT=1080
+HARNESSVM_XFCE_DPI=96
+
+if [ -f "$HARNESSVM_ROOT/config.env" ]; then
+  # config.env is deliberately shell syntax; it is a trusted, user-owned file.
+  # shellcheck disable=SC1091
+  . "$HARNESSVM_ROOT/config.env"
+fi
+
+die() {
+  printf 'harnessvm: %s\n' "$*" >&2
+  exit 1
+}
+
+warn() {
+  printf 'harnessvm: warning: %s\n' "$*" >&2
+}
+
+cleanup_failed_launch() {
+  local exit_code=$? sid=$1 dir="$HARNESSVM_SESSIONS/$1"
+  trap - EXIT INT TERM
+  warn "launch failed; cleaning up $sid"
+  remove_session "$dir" >/dev/null 2>&1 || rm -rf "$dir"
+  exit "$exit_code"
+}
+
+usage() {
+  cat "$HARNESSVM_ROOT/assets/logo-ascii.txt"
+  cat <<'EOF'
+
+HarnessVM lets you quickly launch secure AI sandbox machines with graphical and terminal interfaces.
+https://github.com/themreza/harnessvm
+
+Created by Mohammad Tomaraei
+AI-assisted proof of concept; provided as-is, without warranties or liability.
+
+Usage:
+  harnessvm [PATH] [--read-only] [--mount PATH] [--mount-ro PATH]
+                    [--harness NAME] [--persist DIR] [--allow HOST:PORT]
+                    [--no-browser]
+  harnessvm list
+  harnessvm shell SESSION
+  harnessvm logs SESSION
+  harnessvm stop SESSION
+  harnessvm stop --all
+  harnessvm prune
+  harnessvm vm status|logs|stop|delete
+  harnessvm doctor
+
+With no command, PATH defaults to the current directory. Every launch creates
+an ephemeral desktop container in one fixed Lima VM. `stop` and `delete` are
+equivalent for session containers.
+EOF
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || die "$1 is required"
+}
+
+prepare_state() {
+  mkdir -p "$HARNESSVM_STATE_ROOT" "$HARNESSVM_SESSIONS" "$HARNESSVM_LIMA_HOME"
+  chmod 0700 "$HARNESSVM_STATE_ROOT" "$HARNESSVM_SESSIONS" "$HARNESSVM_LIMA_HOME"
+  local global
+  for global in default.yaml override.yaml base.yaml; do
+    [ ! -e "$HARNESSVM_LIMA_HOME/_config/$global" ] || die "refusing Lima global config: $HARNESSVM_LIMA_HOME/_config/$global"
+  done
+}
+
+lima_status() {
+  limactl list "$HARNESSVM_INSTANCE" --format '{{.Status}}' 2>/dev/null || true
+}
+
+guest() {
+  limactl shell --tty=false "$HARNESSVM_INSTANCE" -- "$@"
+}
+
+backend_ready() {
+  [ "$(lima_status)" = Running ] || return 1
+  guest sh -lc 'command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1' \
+    >/dev/null 2>&1
+}
+
+start_backend() {
+  limactl start --timeout "$HARNESSVM_START_TIMEOUT" "$HARNESSVM_INSTANCE" >/dev/null
+}
+
+resolve_dir() {
+  local value=$1 resolved
+  case "$value" in
+    '~') value=$HOME ;;
+    '~/'*) value="$HOME/${value#~/}" ;;
+  esac
+  [ -d "$value" ] || die "not a directory: $1"
+  [ ! -L "$value" ] || die "refusing a symlink mount: $1"
+  resolved=$(cd "$value" && pwd -P)
+  case "$resolved" in *'|'*|*:*|*$'\n'*) die "mount paths may not contain a colon, pipe, or newline: $resolved" ;; esac
+  printf '%s\n' "$resolved"
+}
+
+validate_endpoint() {
+  local endpoint=$1 host port
+  case "$endpoint" in *:*) ;; *) die "invalid endpoint: $endpoint" ;; esac
+  host=${endpoint%:*}
+  port=${endpoint##*:}
+  case "$host" in ''|-*|*[!A-Za-z0-9_.-]*) die "invalid host: $endpoint" ;; esac
+  case "$port" in ''|*[!0-9]*) die "invalid port: $endpoint" ;; esac
+  [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || die "invalid port: $endpoint"
+}
+
+validate_harness() {
+  case "$1" in ''|*[!a-z0-9-]*) die "invalid harness: $1" ;; esac
+  [ -f "$HARNESSVM_ROOT/harnesses/$1.sh" ] || die "unknown harness: $1"
+}
+
+normalize_persist_dir() {
+  local value=$1
+  case "$value" in
+    "$HOME"/*) value=${value#"$HOME"/} ;;
+    '~/'*) value=${value#~/} ;;
+    /config/*) value=${value#/config/} ;;
+  esac
+  case "$value" in ''|.|..|*/*|*[!A-Za-z0-9._-]*) die "persistent directories must be directly under the desktop home: $1" ;; esac
+  printf '%s\n' "$value"
+}
+
+persistent_volume() {
+  [ "$1" != .codex ] || { printf 'harnessvm-codex-state\n'; return; }
+  printf 'harnessvm-persist-%s\n' "$1"
+}
+
+slug() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9' | cut -c1-20
+}
+
+new_session_id() {
+  local base
+  base=$(slug "$(basename "$1")")
+  [ -n "$base" ] || base=workspace
+  printf 's%s%s%s\n' "$base" "$(date +%y%m%d%H%M%S)" "$$"
+}
+
+session_dir() {
+  local value=$1 exact match count=0
+  exact="$HARNESSVM_SESSIONS/$value"
+  if [ -d "$exact" ]; then printf '%s\n' "$exact"; return; fi
+  for match in "$HARNESSVM_SESSIONS"/"$value"*; do
+    [ -d "$match" ] || continue
+    exact=$match
+    count=$((count + 1))
+  done
+  [ "$count" -eq 1 ] || { [ "$count" -eq 0 ] && die "unknown session: $value"; die "ambiguous session prefix: $value"; }
+  printf '%s\n' "$exact"
+}
+
+session_count() {
+  local dir count=0
+  for dir in "$HARNESSVM_SESSIONS"/*; do [ ! -d "$dir" ] || count=$((count + 1)); done
+  printf '%s\n' "$count"
+}
+
+ensure_instance() {
+  [ -z "$(lima_status)" ] || return 0
+  printf 'Creating the fixed HarnessVM backend (one-time setup)...\n' >&2
+  limactl create --tty=false \
+    --name "$HARNESSVM_INSTANCE" \
+    --cpus "$HARNESSVM_CPUS" \
+    --memory "$HARNESSVM_MEMORY_GIB" \
+    --disk "$HARNESSVM_DISK_GIB" \
+    --vm-type "$HARNESSVM_VM_TYPE" \
+    --arch "$HARNESSVM_ARCH" \
+    --mount-none \
+    --set '.portForwards = []' \
+    "$HARNESSVM_ROOT/vm/lima.yaml"
+}
+
+build_mount_list() {
+  local selected mounts_file
+  selected=$(mktemp "$HARNESSVM_STATE_ROOT/mount-selected.XXXXXX")
+  {
+    for mounts_file in "$HARNESSVM_SESSIONS"/*/mounts; do
+      [ ! -f "$mounts_file" ] || cat "$mounts_file"
+    done
+  } | awk -F'|' '
+    NF == 3 { if ($1 == "rw" || mode[$2] == "") mode[$2] = $1 }
+    END { for (path in mode) print mode[path] "|" path }
+  ' | sort -t'|' -k2,2 >"$selected"
+  printf '%s\n' "$selected"
+}
+
+mount_list_covers() {
+  local available=$1 desired=$2 required_mode path actual_mode root covered
+  [ -f "$available" ] || return 1
+  while IFS='|' read -r required_mode path; do
+    [ -n "$path" ] || continue
+    covered=0
+    while IFS='|' read -r actual_mode root; do
+      [ -n "$root" ] || continue
+      if { [ "$path" = "$root" ] || [[ "$path" == "$root/"* ]]; } \
+        && { [ "$required_mode" = ro ] || [ "$actual_mode" = rw ]; }; then
+        covered=1
+        break
+      fi
+    done <"$available"
+    [ "$covered" -eq 1 ] || return 1
+  done <"$desired"
+}
+
+sync_mounts() {
+  local keep_running=${1:-1} desired status mode path active version
+  local -a edit_args
+  ensure_instance
+  desired=$(build_mount_list)
+  active="$HARNESSVM_STATE_ROOT/mounts.active"
+  version=$(cat "$HARNESSVM_STATE_ROOT/version" 2>/dev/null || true)
+  status=$(lima_status)
+  if [ "$keep_running" -eq 1 ] && [ "$version" = "$HARNESSVM_STATE_VERSION" ] && mount_list_covers "$active" "$desired"; then
+    rm -f "$desired"
+    [ "$status" = Running ] || start_backend
+    return
+  fi
+
+  [ "$status" != Running ] || limactl stop "$HARNESSVM_INSTANCE" >/dev/null
+  edit_args=(edit --tty=false --mount-type "$HARNESSVM_MOUNT_TYPE" --set '.portForwards = []')
+  if [ -s "$desired" ]; then
+    while IFS='|' read -r mode path; do
+      [ "$mode" = rw ] && edit_args+=(--mount-only "$path:w") || edit_args+=(--mount-only "$path")
+    done <"$desired"
+  else
+    edit_args+=(--mount-none)
+  fi
+  limactl "${edit_args[@]}" "$HARNESSVM_INSTANCE" >/dev/null
+  printf '%s\n' "$HARNESSVM_STATE_VERSION" >"$HARNESSVM_STATE_ROOT/version"
+  cp "$desired" "$active"
+  chmod 0600 "$active"
+  rm -f "$desired"
+  [ "$keep_running" -ne 1 ] || start_backend
+}
+
+confirm_launch_mount_restart() {
+  local desired status running answer
+  desired=$(build_mount_list)
+  status=$(lima_status)
+  if [ "$(cat "$HARNESSVM_STATE_ROOT/version" 2>/dev/null || true)" = "$HARNESSVM_STATE_VERSION" ] \
+    && mount_list_covers "$HARNESSVM_STATE_ROOT/mounts.active" "$desired"; then
+    rm -f "$desired"
+    return 0
+  fi
+  rm -f "$desired"
+
+  [ "$status" = Running ] || return 0
+  running=$(( $(session_count) - 1 ))
+  [ "$running" -gt 0 ] || return 0
+
+  if [ ! -t 0 ]; then
+    warn "the mount update would briefly restart $running running session(s); rerun from an interactive terminal to confirm"
+    return 1
+  fi
+  printf 'Updating the Lima mounts will briefly restart %s running HarnessVM session(s). Continue? [y/N] ' "$running" >&2
+  IFS= read -r answer || answer=
+  case "$answer" in
+    y|Y|yes|YES) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+sync_project() {
+  local file guest_tmp="$HARNESSVM_GUEST_PROJECT.new.$$"
+  local -a sources
+  guest rm -rf "$guest_tmp"
+  guest mkdir -p "$guest_tmp"
+  sources=()
+  for file in vm desktop harnesses; do
+    sources+=("$HARNESSVM_ROOT/$file")
+  done
+  limactl copy "${sources[@]}" "$HARNESSVM_INSTANCE:$guest_tmp/" >/dev/null
+  guest bash -c 'set -eu; rm -rf "$1"; mv "$2" "$1"' bash "$HARNESSVM_GUEST_PROJECT" "$guest_tmp"
+  guest sudo install -m 0755 "$HARNESSVM_GUEST_PROJECT/vm/firewall.sh" /usr/local/sbin/harnessvm-firewall
+}
+
+restore_firewall() {
+  guest sudo /usr/local/sbin/harnessvm-firewall
+}
+
+container_id_for() {
+  guest docker ps -aq \
+    --filter "label=io.harnessvm.session=$1" \
+    --filter "label=com.docker.compose.service=desktop" | sed -n '1p'
+}
+
+container_ids_for() {
+  guest docker ps -aq --filter "label=io.harnessvm.session=$1"
+}
+
+session_bridge() {
+  printf 'hv%s\n' "$(printf '%s' "$1" | cksum | cut -d' ' -f1)"
+}
+
+ensure_session_network() {
+  local dir=$1 sid network bridge allow
+  sid=$(basename "$dir")
+  network="hv-net-$sid"
+  bridge=$(session_bridge "$sid")
+  allow=$(cat "$dir/allow")
+  guest docker network create \
+    --driver bridge \
+    --opt "com.docker.network.bridge.name=$bridge" \
+    --label "io.harnessvm.session=$sid" \
+    --label "io.harnessvm.allow=$allow" \
+    "$network" >/dev/null
+}
+
+ensure_persistent_volumes() {
+  local dir=$1 path
+  while read -r path; do
+    guest docker volume create --label "io.harnessvm.persist=$path" "$(persistent_volume "$path")" </dev/null >/dev/null
+  done <"$dir/persist"
+}
+
+ensure_backend() {
+  local dir ids
+  sync_mounts 1
+  backend_ready || die "Docker is not ready in the Lima VM"
+  sync_project
+  restore_firewall
+  for dir in "$HARNESSVM_SESSIONS"/*; do
+    [ -d "$dir" ] || continue
+    ids=$(container_ids_for "$(basename "$dir")")
+    [ -z "$ids" ] || guest docker start $ids >/dev/null
+  done
+}
+
+compose_override() {
+  local dir=$1 output=$2 service mode path target readonly quoted_path quoted_target volume
+  {
+    printf 'services:\n'
+    for service in desktop docker; do
+      printf '  %s:\n    volumes:\n' "$service"
+      while IFS='|' read -r mode path target; do
+        [ "$target" != /workspace ] || continue
+        readonly=false; [ "$mode" != ro ] || readonly=true
+        quoted_path=$(printf '%s' "$path" | sed "s/'/''/g")
+        quoted_target=$(printf '%s' "$target" | sed "s/'/''/g")
+        printf "      - type: bind\n        source: '%s'\n        target: '%s'\n        read_only: %s\n" "$quoted_path" "$quoted_target" "$readonly"
+      done <"$dir/mounts"
+      if [ "$service" = desktop ]; then
+        while read -r path; do
+          volume=$(persistent_volume "$path")
+          printf "      - type: volume\n        source: '%s'\n        target: '/config/%s'\n" "$volume" "$path"
+        done <"$dir/persist"
+      fi
+    done
+    if [ -s "$dir/persist" ]; then
+      printf 'volumes:\n'
+      while read -r path; do
+        volume=$(persistent_volume "$path")
+        printf "  '%s':\n    external: true\n    name: '%s'\n" "$volume" "$volume"
+      done <"$dir/persist"
+    fi
+  } >"$output"
+}
+
+run_compose() {
+  local dir=$1 action=$2 sid project network workspace readonly override persist harnesses
+  shift 2
+  sid=$(basename "$dir")
+  project="hv$sid"
+  network="hv-net-$sid"
+  workspace=$(cat "$dir/workspace")
+  readonly=false; [ "$(cat "$dir/workspace_mode")" != ro ] || readonly=true
+  override="$HARNESSVM_GUEST_PROJECT/override-$sid.yaml"
+  persist=$(paste -sd, "$dir/persist")
+  harnesses=$(paste -sd, "$dir/harnesses")
+  guest env \
+    HARNESSVM_COMPOSE_PROJECT="$project" \
+    HARNESSVM_SESSION="$sid" \
+    HARNESSVM_NETWORK="$network" \
+    HARNESSVM_WORKSPACE="$workspace" \
+    HARNESSVM_WORKSPACE_READ_ONLY="$readonly" \
+    HARNESSVM_HARNESSES="$harnesses" \
+    HARNESSVM_PERSIST_DIRS="$persist" \
+    HARNESSVM_DESKTOP_WIDTH="$HARNESSVM_DESKTOP_WIDTH" \
+    HARNESSVM_DESKTOP_HEIGHT="$HARNESSVM_DESKTOP_HEIGHT" \
+    HARNESSVM_XFCE_DPI="$HARNESSVM_XFCE_DPI" \
+    HARNESSVM_TIMEZONE="$HARNESSVM_TIMEZONE" \
+    docker compose -f "$HARNESSVM_GUEST_PROJECT/vm/compose.yaml" -f "$override" "$action" "$@"
+}
+
+show_access() {
+  local dir=$1 sid web url
+  sid=$(basename "$dir")
+  web=$(cat "$dir/guest_web_port")
+  url="http://127.0.0.1:$web/"
+  printf '\nSession:     %s\n' "$sid"
+  printf 'Browser desktop: %s\n' "$url"
+  printf 'Stop/delete: harnessvm stop %s\n\n' "$sid"
+}
+
+shell_container() {
+  limactl shell --tty=true "$HARNESSVM_INSTANCE" -- \
+    docker exec -it --user 1000:1000 --workdir /workspace "$1" /bin/bash -l
+}
+
+shell_session_dir() {
+  local dir=$1 sid cid
+  sid=$(basename "$dir")
+  ensure_backend
+  cid=$(container_id_for "$sid")
+  [ -n "$cid" ] || die "container is missing for session $sid"
+  shell_container "$cid"
+}
+
+remove_session() {
+  local dir=$1 sid ids network
+  sid=$(basename "$dir")
+  if [ -n "$(lima_status)" ]; then
+    ensure_backend
+    ids=$(container_ids_for "$sid")
+    [ -z "$ids" ] || guest docker rm -f $ids >/dev/null
+    network="hv-net-$sid"
+    guest docker network rm "$network" >/dev/null 2>&1 || true
+    restore_firewall
+  fi
+  rm -rf "$dir"
+  [ "$(session_count)" -gt 0 ] || sync_mounts 0
+  printf 'Removed HarnessVM session %s.\n' "$sid"
+}
+
+launch_session() {
+  local workspace= mode=rw browser=$HARNESSVM_OPEN_BROWSER shell=0 allow=$HARNESSVM_DEFAULT_ALLOW
+  local arg value share_mode share_path share_target share_index=0 custom_harnesses=0
+  local sid dir cid
+  local guest_web override host_url
+  local -a mounts persist_dirs harnesses
+
+  if [ "$#" -gt 0 ] && [[ "$1" != --* ]]; then workspace=$1; shift; else workspace=.; fi
+  workspace=$(resolve_dir "$workspace")
+  mounts=("$mode|$workspace|/workspace")
+  for value in ${allow//,/ }; do validate_endpoint "$value"; done
+  persist_dirs=()
+  for value in ${HARNESSVM_PERSIST_DIRS//,/ }; do persist_dirs+=("$(normalize_persist_dir "$value")"); done
+  harnesses=()
+  for value in ${HARNESSVM_HARNESSES//,/ }; do validate_harness "$value"; harnesses+=("$value"); done
+
+  while [ "$#" -gt 0 ]; do
+    arg=$1; shift
+    case "$arg" in
+      --read-only)
+        mode=ro
+        mounts[0]="$mode|$workspace|/workspace"
+        ;;
+      --mount|--mount-ro)
+        [ "$#" -gt 0 ] || die "$arg needs a path"
+        value=$1; shift
+        share_path=$(resolve_dir "$value")
+        share_mode=rw; [ "$arg" != --mount-ro ] || share_mode=ro
+        share_index=$((share_index + 1))
+        share_target=$(slug "$(basename "$share_path")")
+        [ -n "$share_target" ] || share_target=share
+        share_target="/shares/${share_index}-${share_target}"
+        mounts+=("$share_mode|$share_path|$share_target")
+        ;;
+      --allow)
+        [ "$#" -gt 0 ] || die "$arg needs HOST:PORT"
+        value=$1; shift
+        validate_endpoint "$value"
+        [ -z "$allow" ] && allow=$value || allow="$allow,$value"
+        ;;
+      --persist)
+        [ "$#" -gt 0 ] || die "$arg needs a directory"
+        persist_dirs+=("$(normalize_persist_dir "$1")")
+        shift
+        ;;
+      --harness)
+        [ "$#" -gt 0 ] || die "$arg needs a name"
+        validate_harness "$1"
+        [ "$custom_harnesses" = 1 ] || { harnesses=(); custom_harnesses=1; }
+        harnesses+=("$1")
+        shift
+        ;;
+      --no-browser) browser=0; shell=1 ;;
+      --help|-h) usage; return ;;
+      *) die "unknown launch option: $arg" ;;
+    esac
+  done
+
+  sid=$(new_session_id "$workspace")
+  dir="$HARNESSVM_SESSIONS/$sid"
+  mkdir -m 0700 "$dir"
+  printf '%s\n' "$workspace" >"$dir/workspace"
+  printf '%s\n' "$mode" >"$dir/workspace_mode"
+  printf '%s\n' "${mounts[@]}" >"$dir/mounts"
+  for value in "${harnesses[@]}"; do persist_dirs+=(".$value"); done
+  printf '%s\n' "${harnesses[@]}" | awk 'NF && !seen[$0]++' >"$dir/harnesses"
+  printf '%s\n' "${persist_dirs[@]}" | awk 'NF && !seen[$0]++' >"$dir/persist"
+  printf '%s\n' "$allow" >"$dir/allow"
+  chmod 0600 "$dir"/*
+
+  trap "cleanup_failed_launch $sid" EXIT
+  trap 'exit 130' INT TERM
+
+  if ! confirm_launch_mount_restart; then
+    trap - EXIT INT TERM
+    rm -rf "$dir"
+    die "launch cancelled; existing sessions were left running"
+  fi
+  ensure_backend
+  ensure_session_network "$dir"
+  ensure_persistent_volumes "$dir"
+  restore_firewall
+
+  override="$dir/override.yaml"
+  compose_override "$dir" "$override"
+  limactl copy "$override" "$HARNESSVM_INSTANCE:$HARNESSVM_GUEST_PROJECT/override-$sid.yaml" >/dev/null
+  printf 'Starting Ubuntu desktop container %s...\n' "$sid" >&2
+  run_compose "$dir" up -d --build --wait --wait-timeout 600 --remove-orphans
+  cid=$(container_id_for "$sid")
+  [ -n "$cid" ] || die "Compose did not create the desktop container"
+  guest_web=$(guest docker port "$cid" 3000/tcp | sed -n '1s/.*://p')
+  case "$guest_web" in ''|*[!0-9]*) die "could not determine guest browser port" ;; esac
+  printf '%s\n' "$guest_web" >"$dir/guest_web_port"
+  trap - EXIT INT TERM
+
+  show_access "$dir"
+  host_url="http://127.0.0.1:$guest_web/"
+  if [ "$browser" = 1 ] && command -v open >/dev/null 2>&1; then open "$host_url" >/dev/null 2>&1 || true; fi
+  [ "$shell" = 0 ] || shell_container "$cid"
+}
+
+list_sessions() {
+  local dir sid workspace status web cid backend
+  backend=$(lima_status)
+  printf '%-34s %-10s %-13s %s\n' SESSION STATUS 'DESKTOP PORT' WORKSPACE
+  for dir in "$HARNESSVM_SESSIONS"/*; do
+    [ -d "$dir" ] || continue
+    sid=$(basename "$dir")
+    workspace=$(cat "$dir/workspace")
+    status=unknown
+    if [ "$backend" = Running ]; then
+      cid=$(container_id_for "$sid")
+      if [ -n "$cid" ]; then status=$(guest docker inspect --format '{{.State.Status}}' "$cid"); else status=missing; fi
+    elif [ -n "$backend" ]; then status=vm-stopped; fi
+    web=$(cat "$dir/guest_web_port" 2>/dev/null || printf '-')
+    printf '%-34s %-10s %-13s %s\n' "$sid" "$status" "$web" "$workspace"
+  done
+}
+
+doctor() {
+  require_command limactl
+  limactl validate "$HARNESSVM_ROOT/vm/lima.yaml" >/dev/null
+  printf 'HarnessVM prerequisites and Lima template: ok\n'
+  local backend
+  backend=$(lima_status)
+  [ -n "$backend" ] || backend='not created'
+  printf 'Backend: %s\n' "$backend"
+}
+
+prune_backend() {
+  [ "$(lima_status)" = Running ] || die "the HarnessVM backend is not running"
+  guest docker system prune -f >/dev/null
+  limactl prune >/dev/null 2>&1 || true
+  printf 'Removed unused containers, networks, image layers, and build cache.\n'
+}
+
+vm_command() {
+  local action=${1:-}
+  case "$action" in
+    status)
+      [ "$#" -eq 1 ] || die "vm status takes no arguments"
+      local backend
+      backend=$(lima_status)
+      [ -n "$backend" ] || backend='not created'
+      printf 'Backend: %s\n' "$backend"
+      ;;
+    logs)
+      [ "$#" -eq 1 ] || die "vm logs takes no arguments"
+      local agent_log="$HARNESSVM_LIMA_HOME/$HARNESSVM_INSTANCE/ha.stderr.log"
+      [ -f "$agent_log" ] || die "the HarnessVM backend has no host-agent log"
+      tail -n 200 -F "$agent_log"
+      ;;
+    stop)
+      [ "$#" -eq 1 ] || die "vm stop takes no arguments"
+      [ "$(lima_status)" != Running ] || limactl stop "$HARNESSVM_INSTANCE"
+      ;;
+    delete)
+      [ "$#" -eq 1 ] || die "vm delete takes no arguments"
+      [ -n "$(lima_status)" ] || die "the HarnessVM backend does not exist"
+      printf 'Delete the fixed VM, all cached images, and persistent tool data? [y/N] '
+      IFS= read -r answer
+      case "$answer" in y|Y|yes|YES) ;; *) printf 'Cancelled.\n'; return ;; esac
+      limactl delete --force "$HARNESSVM_INSTANCE"
+      rm -rf "$HARNESSVM_SESSIONS" \
+        "$HARNESSVM_STATE_ROOT/mounts.active" \
+        "$HARNESSVM_STATE_ROOT/version"
+      mkdir -m 0700 "$HARNESSVM_SESSIONS"
+      ;;
+    *) die "vm requires status, logs, stop, or delete" ;;
+  esac
+}
+
+prepare_state
+
+case "${1:-}" in
+  list)
+    shift; [ "$#" -eq 0 ] || die "list takes no arguments"; list_sessions ;;
+  shell)
+    shift; [ "$#" -eq 1 ] || die "shell requires one session"; shell_session_dir "$(session_dir "$1")" ;;
+  logs)
+    shift; [ "$#" -eq 1 ] || die "logs requires one session"; ensure_backend; sid=$(basename "$(session_dir "$1")"); cid=$(container_id_for "$sid"); [ -n "$cid" ] || die "container is missing"; guest docker logs --tail 200 -f "$cid" ;;
+  stop|delete)
+    command=$1; shift
+    if [ "${1:-}" = --all ]; then
+      shift; [ "$#" -eq 0 ] || die "$command --all takes no more arguments"
+      for dir in "$HARNESSVM_SESSIONS"/*; do [ ! -d "$dir" ] || remove_session "$dir"; done
+    else
+      [ "$#" -eq 1 ] || die "$command requires one session or --all"
+      remove_session "$(session_dir "$1")"
+    fi
+    ;;
+  prune)
+    shift; [ "$#" -eq 0 ] || die "prune takes no arguments"; prune_backend ;;
+  vm)
+    shift; vm_command "$@" ;;
+  doctor)
+    shift; [ "$#" -eq 0 ] || die "doctor takes no arguments"; doctor ;;
+  help|--help|-h)
+    usage ;;
+  '')
+    launch_session . ;;
+  *)
+    launch_session "$@" ;;
+esac

@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Visual Studio Code
+Comment=Open the mounted project in Visual Studio Code
+Exec=/usr/local/bin/code --new-window /workspace
+TryExec=/usr/local/bin/code
+Path=/workspace
+Icon=vscode
+Terminal=false
+StartupNotify=true
+OnlyShowIn=XFCE;
+X-GNOME-Autostart-enabled=true

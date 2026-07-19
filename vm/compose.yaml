@@ -1,0 +1,80 @@
+name: ${HARNESSVM_COMPOSE_PROJECT:?set HARNESSVM_COMPOSE_PROJECT}
+
+services:
+  desktop:
+    image: harnessvm/ubuntu-desktop:local
+    build:
+      context: ..
+      dockerfile: desktop/Dockerfile
+    environment:
+      PUID: "1000"
+      PGID: "1000"
+      DOCKER_HOST: tcp://docker:2375
+      HARNESSVM_HARNESSES: ${HARNESSVM_HARNESSES:-codex,claude}
+      HARNESSVM_PERSIST_DIRS: ${HARNESSVM_PERSIST_DIRS-}
+      HARNESSVM_XFCE_DPI: ${HARNESSVM_XFCE_DPI:-96}
+      TZ: ${HARNESSVM_TIMEZONE:-Etc/UTC}
+      TITLE: HarnessVM
+      START_DOCKER: "false"
+      DISABLE_IPV6: "true"
+      SELKIES_ENABLE_SHARING: "false|locked"
+      SELKIES_FILE_TRANSFERS: ""
+      SELKIES_AUDIO_ENABLED: "false|locked"
+      SELKIES_MICROPHONE_ENABLED: "false|locked"
+      SELKIES_SCALING_DPI: "${HARNESSVM_XFCE_DPI:-96}"
+      SELKIES_MANUAL_WIDTH: "${HARNESSVM_DESKTOP_WIDTH:-1920}"
+      SELKIES_MANUAL_HEIGHT: "${HARNESSVM_DESKTOP_HEIGHT:-1080}"
+    volumes:
+      - type: bind
+        source: ${HARNESSVM_WORKSPACE:?set HARNESSVM_WORKSPACE}
+        target: /workspace
+        read_only: ${HARNESSVM_WORKSPACE_READ_ONLY:-false}
+    tmpfs:
+      - /config:uid=1000,gid=1000,mode=0700
+      - /tmp:mode=1777
+    ports:
+      - "127.0.0.1::3000"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:3000/ >/dev/null"]
+      interval: 2s
+      timeout: 2s
+      retries: 90
+    labels:
+      io.harnessvm.session: ${HARNESSVM_SESSION:?set HARNESSVM_SESSION}
+    networks:
+      session: {}
+    shm_size: 1gb
+    pids_limit: 1024
+    restart: "no"
+    depends_on:
+      docker:
+        condition: service_healthy
+
+  docker:
+    image: docker:29-dind@sha256:bfec1f5159c63a81ca6fdedbd81404d2c0e16378ed0feec3bb3fbf3998847659
+    privileged: true
+    environment:
+      DOCKER_TLS_CERTDIR: ""
+    volumes:
+      - type: bind
+        source: ${HARNESSVM_WORKSPACE:?set HARNESSVM_WORKSPACE}
+        target: /workspace
+        read_only: ${HARNESSVM_WORKSPACE_READ_ONLY:-false}
+    labels:
+      io.harnessvm.session: ${HARNESSVM_SESSION:?set HARNESSVM_SESSION}
+    networks:
+      session:
+        aliases:
+          - docker
+    healthcheck:
+      test: ["CMD-SHELL", "DOCKER_HOST=tcp://127.0.0.1:2375 docker info >/dev/null 2>&1"]
+      interval: 1s
+      timeout: 3s
+      retries: 60
+      start_period: 5s
+    restart: "no"
+
+networks:
+  session:
+    external: true
+    name: ${HARNESSVM_NETWORK:?set HARNESSVM_NETWORK}

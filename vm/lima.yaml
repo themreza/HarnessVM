@@ -1,0 +1,32 @@
+minimumLimaVersion: 2.1.2
+
+base:
+  - template:docker-rootful
+
+ssh:
+  loadDotSSHPubKeys: false
+  forwardAgent: false
+
+propagateProxyEnv: false
+
+user:
+  name: harnessvm
+  home: /home/harnessvm
+  uid: 1000
+
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux -o pipefail
+      command -v nft >/dev/null 2>&1 && exit 0
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update
+      apt-get install -y --no-install-recommends nftables
+      rm -rf /var/lib/apt/lists/*
+
+probes:
+  - description: nftables to be installed
+    script: |
+      #!/bin/sh
+      command -v nft >/dev/null
