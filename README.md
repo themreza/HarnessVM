@@ -6,9 +6,9 @@ HarnessVM lets you quickly launch secure AI sandbox machines with graphical and 
 
 ## Demo
 
-Learn about HarnessVM with [this one-minute YouTube video](https://www.youtube.com/watch?v=B4rNu9ei-Sg).
+Learn about HarnessVM with [this one-minute YouTube video](https://youtu.be/oWmooCMzAaE).
 
-[![HarnessVM demo](assets/youtube.jpg)](https://www.youtube.com/watch?v=B4rNu9ei-Sg)
+[![HarnessVM demo](assets/youtube.jpg)](https://youtu.be/oWmooCMzAaE)
 
 ## Why HarnessVM?
 
