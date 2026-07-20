@@ -4,6 +4,12 @@ HarnessVM lets you quickly launch secure AI sandbox machines with graphical and 
 
 ![HarnessVM logo](assets/logo.jpg)
 
+## Demo
+
+Learn about HarnessVM with [this one-minute YouTube video](https://www.youtube.com/watch?v=B4rNu9ei-Sg).
+
+[![HarnessVM demo](assets/youtube.jpg)](https://www.youtube.com/watch?v=B4rNu9ei-Sg)
+
 ## Why HarnessVM?
 
 A full desktop lets agents control an entire sandboxed OS. They can run end-to-end tests and operate installed programs through MCP.
