@@ -100,7 +100,7 @@ All sessions share one VM. Keep untrusted projects in a separate VM.
 
 HarnessVM is useful for testing agentic harnesses with on-device models such as Qwen and Gemma. Run them on the host with LM Studio, llama.cpp, or another OpenAI-compatible inference engine.
 
-Allow the host's LM Studio port, then point Pi at PrismML's loaded `bonsai-27b` model:
+For example, you can allow the host's LM Studio port, then point Pi at PrismML's loaded `bonsai-27b` model:
 
 ```sh
 harnessvm . --harness pi --allow host.lima.internal:1234 --no-browser
