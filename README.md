@@ -2,7 +2,7 @@
 
 HarnessVM lets you quickly launch secure AI sandbox machines with graphical and terminal interfaces.
 
-![HarnessVM logo](assets/logo.jpg)
+[![HarnessVM logo](assets/logo.jpg)](https://github.com/themreza/harnessvm)
 
 ## Demo
 
